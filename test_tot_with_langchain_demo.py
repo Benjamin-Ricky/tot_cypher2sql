@@ -9,6 +9,8 @@ import re
 from database import Neo4jManager, MySQLManager
 from prompts_template import PromptTemplates
 from responses_template import ResponseTemplates
+from pydantic import BaseModel, Field
+import json
 
 # 知识图谱中的存在的查询项集
 valid = [] 
@@ -85,63 +87,212 @@ class EntityExtractor:
             
         return entities
 
-class PowerDispatchChecker(ToTChecker):
-    def __init__(self):
-        self.intent_recognizer = IntentRecognizer()
-        self.entity_extractor = EntityExtractor()
-        self.neo4j_manager = Neo4jManager()
-        self.mysql_manager = MySQLManager()
-        self.valid_entities = self.neo4j_manager.get_valid_entities()
-        self.current_step = 0
-        self.max_steps = 3
-        self.current_query_info = {
+class ThoughtSolverPrompt:
+    def format(self, **kwargs) -> str:
+        problem = kwargs.get("problem_description", "")
+        thoughts = kwargs.get("thoughts", [])
+        current_step = kwargs.get("current_step", 0)
+        
+        base_prompt = f"""你是一个专业的电力调度员，需要帮助查询电力系统数据。你必须严格按照以下步骤执行查询：
+
+问题: {problem}
+
+已有的思考:
+{self._format_thoughts(thoughts)}
+
+"""
+        
+        # 根据当前步骤生成不同的提示词
+        if current_step == 0:
+            prompt = base_prompt + """
+第1步 - 意图识别：
+请分析查询属于以下哪种类型：
+1. 计算点查询（如：最大值、最小值）- 需要查询历史采样保存表
+2. 计划比较查询（如：实际值与预测值比较）- 需要查询历史采样保存表
+3. 场站信息查询（如：装机容量、利用小时数）- 需要查询电厂信息表
+
+输出格式：
+```json
+{
+    "thought": "这是一个[具体类型]查询，需要查询[具体表名]",
+    "value": 0.9,
+    "proposed_thoughts": [
+        "下一步需要确定具体的查询字段",
+        "需要提取时间/地点等关键信息"
+    ]
+}
+```
+"""
+
+        elif current_step == 1:
+            prompt = base_prompt + """
+第2步 - 实体提取和知识图谱查询：
+请从问题中提取以下信息用于查询知识图谱：
+1. 时间信息（如：今天、昨天、具体日期）
+2. 值类型（如：系统负荷、装机容量）
+3. 地点信息（如：广东省）
+4. 电厂类型（如：煤电、燃气）
+
+然后生成Neo4j查询语句，格式如下：
+```json
+{
+    "thought": "需要在知识图谱中查找[具体表名]和[具体字段]的关系",
+    "value": 0.9,
+    "proposed_thoughts": [
+        "MATCH (t:Table)-[:CONTAINS]->(v:ValueType) WHERE...",
+        "需要获取表名和字段名用于后续MySQL查询"
+    ]
+}
+```
+"""
+
+        else:
+            prompt = base_prompt + """
+第3步 - MySQL查询语句生成：
+基于知识图谱查询结果，请生成具体的MySQL查询语句：
+1. 使用正确的表名和字段名
+2. 添加适当的时间条件
+3. 根据查询类型添加聚合函数（如MAX、AVG等）
+
+输出格式：
+```json
+{
+    "thought": "生成MySQL查询语句获取具体数据",
+    "value": 0.9,
+    "proposed_thoughts": [
+        "SELECT [具体字段] FROM [表名] WHERE...",
+        "需要考虑时间范围和其他过滤条件"
+    ]
+}
+```
+"""
+
+        return prompt
+
+    def _format_thoughts(self, thoughts: List[str]) -> str:
+        if not thoughts:
+            return "暂无已有思考"
+        return "\n".join(f"- {t}" for t in thoughts)
+
+class PowerDispatchChecker(ToTChecker, BaseModel):
+    intent_recognizer: IntentRecognizer = Field(default_factory=IntentRecognizer)
+    entity_extractor: EntityExtractor = Field(default_factory=EntityExtractor)
+    neo4j_manager: Neo4jManager = Field(default_factory=Neo4jManager)
+    mysql_manager: MySQLManager = Field(default_factory=MySQLManager)
+    valid_entities: list = Field(default_factory=list)
+    current_step: int = Field(default=0)
+    max_steps: int = Field(default=3)
+    current_query_info: Dict[str, Any] = Field(
+        default_factory=lambda: {
             'intent': None,
             'entities': None,
-            'table_info': None
+            'table_info': None,
+            'result': None
         }
-        self.prompts = PromptTemplates()
-        self.response_templates = ResponseTemplates()
-        
+    )
+    prompts: PromptTemplates = Field(default_factory=PromptTemplates)
+    response_templates: ResponseTemplates = Field(default_factory=ResponseTemplates)
+
+    def __init__(self, **data):
+        super().__init__(**data)
+        self.valid_entities = self.neo4j_manager.get_valid_entities()
+
     def evaluate(self, problem_description: str, thoughts: Tuple[str, ...] = ()) -> ThoughtValidity:
-        last_thought = thoughts[-1]
-        self.current_step += 1
+        last_thought = thoughts[-1] if thoughts else ""
         
         try:
+            # 解析大模型的输出
+            if last_thought:
+                try:
+                    thought_json = json.loads(last_thought)
+                    current_thought = thought_json.get("thought", "")
+                except:
+                    current_thought = last_thought
+            else:
+                current_thought = ""
+
             # Step 1: 意图识别
-            if self.current_step == 1:
+            if self.current_step == 0:
                 intent = self.intent_recognizer.recognize(problem_description)
                 if intent:
                     self.current_query_info['intent'] = intent
+                    self.current_step += 1
                     return ThoughtValidity.VALID_INTERMEDIATE
                 return ThoughtValidity.INVALID
-                
-            # Step 2: 实体提取和验证
-            if self.current_step == 2:
+
+            # Step 2: 实体提取和Neo4j查询
+            elif self.current_step == 1:
                 entities = self.entity_extractor.extract(problem_description)
-                if self._validate_entities(entities):
+                if entities:
                     self.current_query_info['entities'] = entities
-                    # 获取表格信息
-                    self.current_query_info['table_info'] = self.neo4j_manager.get_table_info(
+                    
+                    # 生成并执行Neo4j查询
+                    cypher_info = self._generate_cypher_query(
                         self.current_query_info['intent'],
                         entities
                     )
-                    return ThoughtValidity.VALID_INTERMEDIATE
+                    
+                    table_info = self.neo4j_manager.execute_query(
+                        cypher_info["query"],
+                        cypher_info["parameters"]
+                    )
+                    
+                    if table_info:
+                        self.current_query_info['table_info'] = table_info
+                        self.current_step += 1
+                        return ThoughtValidity.VALID_INTERMEDIATE
                 return ThoughtValidity.INVALID
+
+            # Step 3: 生成和执行SQL查询
+            elif self.current_step == 2:
+                sql_query = self._generate_sql_query(
+                    self.current_query_info['intent'],
+                    self.current_query_info['entities'],
+                    self.current_query_info['table_info']
+                )
                 
-            # Step 3: 查询语句生成和验证
-            if self.current_step == 3:
-                if self._is_valid_query(last_thought):
-                    # 执行查询
-                    result = self.mysql_manager.execute_query(last_thought)
-                    self.current_query_info['result'] = result
-                    return ThoughtValidity.VALID_FINAL
+                if sql_query:
+                    result = self.mysql_manager.execute_query(sql_query)
+                    if result:
+                        self.current_query_info['result'] = result
+                        self.current_step += 1
+                        return ThoughtValidity.VALID_FINAL
                 return ThoughtValidity.INVALID
-            
+
         except Exception as e:
             print(f"Error in evaluate: {str(e)}")
             return ThoughtValidity.INVALID
-        
+
         return ThoughtValidity.INVALID
+
+    def _generate_sql_query(self, intent: str, entities: Dict[str, str], table_info: Dict[str, str]) -> str:
+        """根据意图、实体和表信息生成SQL查询语句"""
+        if intent == QueryType.CALCULATION_POINT:
+            return f"""
+            SELECT 时间, 系统负荷
+            FROM yc_hs_720001cur_010
+            WHERE 时间 >= '{entities['time']} 00:00:00'
+            AND 时间 <= '{entities['time']} 23:59:59'
+            ORDER BY 系统负荷 DESC
+            LIMIT 1
+            """
+        
+        elif intent == QueryType.PLAN_COMPARISON:
+            return f"""
+            SELECT 时间, 系统负荷 as actual_value, 系统负荷预测值 as predicted_value,
+                   (系统负荷 - 系统负荷预测值) as difference
+            FROM yc_hs_720001cur_010
+            WHERE 时间 >= '{entities['time']} 00:00:00'
+            AND 时间 <= '{entities['time']} 23:59:59'
+            """
+        
+        elif intent == QueryType.STATION_INFO:
+            return f"""
+            SELECT *
+            FROM power_plant_info
+            WHERE 所在地区 = '{entities['location']}'
+            AND 类型 = '{entities.get('plant_type', '煤电')}'
+            """
 
     def _validate_entities(self, entities: Dict[str, str]) -> bool:
         # 验证提取的实体是否在知识图谱中存在
@@ -214,6 +365,40 @@ class PowerDispatchChecker(ToTChecker):
         except Exception as e:
             print(f"Error formatting result: {str(e)}")
             return self.response_templates.ERROR_TEMPLATES["system_error"]
+
+    def _generate_cypher_query(self, intent: str, entities: Dict[str, str]) -> Dict[str, Dict[str, str]]:
+        """根据意图和实体生成Cypher查询语句"""
+        if intent == QueryType.CALCULATION_POINT:
+            return {
+                "query": """
+                MATCH (t:Table)-[:CONTAINS]->(v:ValueType {name: $value_type})
+                RETURN t.name as table_name, v.name as column_name
+                """,
+                "parameters": {"value_type": entities.get('value_type', '系统负荷')}
+            }
+            
+        elif intent == QueryType.PLAN_COMPARISON:
+            value_type = entities.get('value_type', '系统负荷')
+            return {
+                "query": """
+                MATCH (t:Table)-[:CONTAINS]->(v:ValueType)
+                WHERE v.name IN [$value_type, $predicted_type]
+                RETURN t.name as table_name, v.name as column_name
+                """,
+                "parameters": {
+                    "value_type": value_type,
+                    "predicted_type": f"{value_type}预测值"
+                }
+            }
+            
+        elif intent == QueryType.STATION_INFO:
+            return {
+                "query": """
+                MATCH (t:Table)-[:LOCATED_IN]->(l:Location {name: $location})
+                RETURN t.name as table_name, l.name as location
+                """,
+                "parameters": {"location": entities.get('location')}
+            }
 
 def generate_prompt(query: str, intent: str, entities: Dict[str, str]) -> str:
     """生成提示词模板"""

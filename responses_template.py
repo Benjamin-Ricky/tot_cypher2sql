@@ -16,6 +16,39 @@ class ResponseTemplates:
     4. 必要时提供专业建议
     """
     
+    # 错误响应模板
+    ERROR_TEMPLATES = {
+        "no_data": "抱歉，未能找到相关数据。",
+        "invalid_query": "抱歉，查询格式不正确。",
+        "system_error": "系统处理出现错误，请稍后重试。"
+    }
+
+    # 负荷查询响应模板
+    LOAD_TEMPLATES = {
+        "max_load": """
+在{time}，系统最高负荷达到{value:.2f} MW，发生在{occurrence_time}。
+负荷走势{trend_description}，{factor_analysis}。
+""",
+        "load_comparison": """
+在{time}，系统实际负荷为{actual_value:.2f} MW，
+{difference_description}，
+偏差率为{deviation_rate:.2f}%。
+原因分析：{deviation_reason}
+建议：{suggestion}
+"""
+    }
+
+    # 电厂信息响应模板
+    PLANT_TEMPLATES = {
+        "capacity_info": """
+{location}{plant_type}电厂共{plant_count}家，
+总装机容量达到{total_capacity:.2f} MW，
+年利用小时数{usage_hours:.2f}小时，
+同比{year_on_year_change:+.2f}%。
+在该地区发电量占比{generation_percentage:.2f}%。
+"""
+    }
+    
     # 负荷查询回答模板
     LOAD_QUERY_TEMPLATES = {
         # 系统负荷最高值
@@ -66,15 +99,24 @@ class ResponseTemplates:
         """
     }
     
-    # 错误回答模板
-    ERROR_TEMPLATES = {
-        "no_data": "抱歉，未能查询到相关数据。请确认查询条件是否正确，或尝试调整查询时间范围。",
-        "invalid_query": "查询参数有误，请检查输入的时间、地点等信息是否准确。",
-        "system_error": "系统处理异常，请稍后重试或联系技术支持。"
-    }
-    
     @staticmethod
-    def format_load_response(template_type: str, data: Dict) -> str:
+    def format_load_response(template_type: str, data: dict) -> str:
+        """格式化负荷相关的响应"""
+        template = ResponseTemplates.LOAD_TEMPLATES.get(template_type)
+        if not template:
+            return ResponseTemplates.ERROR_TEMPLATES["invalid_query"]
+        return template.format(**data)
+
+    @staticmethod
+    def format_plant_response(template_type: str, data: dict) -> str:
+        """格式化电厂信息相关的响应"""
+        template = ResponseTemplates.PLANT_TEMPLATES.get(template_type)
+        if not template:
+            return ResponseTemplates.ERROR_TEMPLATES["invalid_query"]
+        return template.format(**data)
+
+    @staticmethod
+    def format_load_response_old(template_type: str, data: Dict) -> str:
         """格式化负荷相关的回答"""
         template = ResponseTemplates.LOAD_QUERY_TEMPLATES.get(template_type)
         if not template:
@@ -97,7 +139,7 @@ class ResponseTemplates:
             return ResponseTemplates.ERROR_TEMPLATES["system_error"]
     
     @staticmethod
-    def format_plant_response(template_type: str, data: Dict) -> str:
+    def format_plant_response_old(template_type: str, data: Dict) -> str:
         """格式化电厂信息相关的回答"""
         template = ResponseTemplates.PLANT_INFO_TEMPLATES.get(template_type)
         if not template:

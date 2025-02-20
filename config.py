@@ -1,7 +1,8 @@
 NEO4J_CONFIG = {
-    'uri': 'bolt://116.56.143.11:7687',
-    'user': 'neo4j',
-    'password': 'your_password'
+    'uri': 'bolt://localhost:7687',
+    'user': '1436684829@qq.com',
+    'password': 'Lyc123456',
+    'database': 'neo4j'
 }
 
 MYSQL_CONFIG = {
